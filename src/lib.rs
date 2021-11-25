@@ -1,3 +1,4 @@
+#![doc = include_str!("../README.md")]
 #[cfg(feature = "smallvec")]
 mod small_vec_builder;
 #[cfg(feature = "stdvec")]
