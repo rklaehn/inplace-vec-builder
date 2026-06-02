@@ -6,8 +6,9 @@ use smallvec::{Array, SmallVec};
 
 /// builds a SmallVec out of itself
 pub struct InPlaceSmallVecBuilder<'a, A: Array> {
-    /// the underlying vector. Its `len` always equals `t1`; source elements
-    /// live in spare capacity `[s0..s1)`.
+    /// the underlying vector. While the builder is alive its `len` is kept at 0
+    /// and it is treated as raw storage: the target lives in `[0..t1)` and the
+    /// source in `[s0..s1)`, both beyond the (zero) length. `Drop` sets `len` to `t1`.
     v: &'a mut SmallVec<A>,
     /// the end of the target area
     t1: usize,
@@ -34,8 +35,8 @@ impl<'a, T: Debug, A: Array<Item = T>> Debug for InPlaceSmallVecBuilder<'a, A> {
 impl<'a, A: Array> From<&'a mut SmallVec<A>> for InPlaceSmallVecBuilder<'a, A> {
     fn from(value: &'a mut SmallVec<A>) -> Self {
         let s1 = value.len();
-        // Establish the invariant `len == t1 == 0` from construction. This does
-        // NOT drop anything: the source bytes remain in spare capacity `[0..s1)`.
+        // Take over the vec as raw storage: set its len to 0. This does NOT drop
+        // anything; the source bytes remain in spare capacity `[0..s1)`.
         unsafe {
             value.set_len(0);
         }
@@ -51,7 +52,9 @@ impl<'a, A: Array> From<&'a mut SmallVec<A>> for InPlaceSmallVecBuilder<'a, A> {
 impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
     /// The current target part as a slice
     pub fn target_slice(&self) -> &[A::Item] {
-        &self.v[..self.t1]
+        // `v.len()` is 0 while the builder is alive, so the target `[0..t1)` is in
+        // spare capacity; slice it directly.
+        unsafe { std::slice::from_raw_parts(self.v.as_ptr(), self.t1) }
     }
 
     /// The current source part as a slice
@@ -91,8 +94,8 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
             unsafe {
                 // just move source to the end without any concern about dropping
                 copy(v.as_mut_ptr(), self.s0, cap - sn, sn);
-                // restore the invariant `len == t1`
-                v.set_len(self.t1);
+                // restore len to 0; the target stays in spare capacity until Drop
+                v.set_len(0);
             }
             // move the source cursors
             self.s0 = cap - sn;
@@ -121,12 +124,8 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
     }
 
     fn push_unsafe(&mut self, value: A::Item) {
-        unsafe {
-            std::ptr::write(self.v.as_mut_ptr().add(self.t1), value);
-            self.t1 += 1;
-            // keep the invariant `len == t1` so a leak right after a push is sound
-            self.v.set_len(self.t1);
-        }
+        unsafe { std::ptr::write(self.v.as_mut_ptr().add(self.t1), value) }
+        self.t1 += 1;
     }
 
     /// Consume `n` elements from the source. If `take` is true they will be added to the target,
@@ -143,10 +142,6 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
             }
             self.t1 += n;
             self.s0 += n;
-            // keep the invariant `len == t1`
-            unsafe {
-                self.v.set_len(self.t1);
-            }
         } else {
             for _ in 0..n {
                 unsafe {
@@ -181,10 +176,6 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
         }
         self.t1 += n;
         self.s0 += n;
-        // keep the invariant `len == t1`
-        unsafe {
-            self.v.set_len(self.t1);
-        }
     }
 
     /// Takes the next element from the source, if it exists
@@ -198,13 +189,15 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
     }
 
     fn drop_source(&mut self) {
-        // The target prefix is already the content of `v` (`len == t1`).
-        // Drop the source elements that live in spare capacity `[s0..s1)`.
-        // Set `s1 = s0` BEFORE dropping for panic-safety.
+        // While the builder was alive `v.len()` was 0. First expose the finished
+        // target prefix by setting the length to `t1` (done before the drop, so a
+        // panicking source destructor still leaves a valid vec). Then drop the
+        // source elements, which live in spare capacity `[s0..s1)`.
         let start = self.s0;
         let len = self.s1 - self.s0;
         self.s1 = self.s0;
         unsafe {
+            self.v.set_len(self.t1);
             std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
                 self.v.as_mut_ptr().add(start),
                 len,
@@ -339,11 +332,14 @@ mod tests {
             builder.push(x); // enters the intermediate post-reserve state
             std::mem::forget(builder);
         }
-        assert_eq!(vec.len(), 1); // target prefix only, not the corrupt cap len
-        drop(vec); // must free x once, must NOT touch a/b
+        // The builder was forgotten, so its `Drop` never ran: the vec is left
+        // empty (a valid state), not with the corrupt `len == cap`. Every element
+        // leaks in spare capacity, which is safe — `forget` opts into leaking.
+        assert_eq!(vec.len(), 0);
+        drop(vec); // empty vec: frees the buffer, runs no destructors
 
-        td.assert_drop(x_id); // moved into vec, dropped exactly once
-        td.assert_no_drop(a_id); // leaked in spare capacity (safe)
+        td.assert_no_drop(x_id);
+        td.assert_no_drop(a_id);
         td.assert_no_drop(b_id);
     }
 }
