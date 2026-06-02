@@ -75,23 +75,24 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
     fn reserve(&mut self, capacity: usize) {
         // ensure we have space!
         if self.t1 + capacity > self.s0 {
+            let v = &mut self.v;
             let sn = self.s1 - self.s0;
             // Momentarily extend `len` to cover the source so that a realloc
             // inside `SmallVec::reserve` preserves it (`reserve` only copies `[0..len)`).
             // This transient `len == s1` window is non-reentrant, and allocation
             // failure aborts rather than unwinds, so it is never observable by a leak.
             unsafe {
-                self.v.set_len(self.s1);
+                v.set_len(self.s1);
             }
             // delegate to the underlying vec for the grow logic
-            self.v.reserve(capacity);
+            v.reserve(capacity);
             // move the source to the end of the vec
-            let cap = self.v.capacity();
+            let cap = v.capacity();
             unsafe {
                 // just move source to the end without any concern about dropping
-                copy(self.v.as_mut_ptr(), self.s0, cap - sn, sn);
+                copy(v.as_mut_ptr(), self.s0, cap - sn, sn);
                 // restore the invariant `len == t1`
-                self.v.set_len(self.t1);
+                v.set_len(self.t1);
             }
             // move the source cursors
             self.s0 = cap - sn;
@@ -132,7 +133,7 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
     /// else they will be dropped.
     #[inline]
     pub fn consume(&mut self, n: usize, take: bool) {
-        let n = std::cmp::min(n, self.s1 - self.s0);
+        let n = std::cmp::min(n, self.source_slice().len());
         let v = self.v.as_mut_ptr();
         if take {
             if self.t1 != self.s0 {
@@ -159,7 +160,7 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
     /// Skip up to `n` elements from source without adding them to the target.
     /// They will be immediately dropped!
     pub fn skip(&mut self, n: usize) {
-        let n = std::cmp::min(n, self.s1 - self.s0);
+        let n = std::cmp::min(n, self.source_slice().len());
         let v = self.v.as_mut_ptr();
         for _ in 0..n {
             unsafe {
@@ -172,7 +173,7 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
     /// Take up to `n` elements from source to target.
     /// If n is larger than the size of the remaining source, this will only copy all remaining elements in source.
     pub fn take(&mut self, n: usize) {
-        let n = std::cmp::min(n, self.s1 - self.s0);
+        let n = std::cmp::min(n, self.source_slice().len());
         if self.t1 != self.s0 {
             unsafe {
                 copy(self.v.as_mut_ptr(), self.s0, self.t1, n);
@@ -189,9 +190,8 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
     /// Takes the next element from the source, if it exists
     pub fn pop_front(&mut self) -> Option<A::Item> {
         if self.s0 < self.s1 {
-            let value = unsafe { std::ptr::read(self.v.as_ptr().add(self.s0)) };
             self.s0 += 1;
-            Some(value)
+            Some(unsafe { std::ptr::read(self.v.as_ptr().add(self.s0 - 1)) })
         } else {
             None
         }
