@@ -6,18 +6,20 @@ use smallvec::{Array, SmallVec};
 
 /// builds a SmallVec out of itself
 pub struct InPlaceSmallVecBuilder<'a, A: Array> {
-    /// the underlying vector, possibly containing some uninitialized values in the middle!
+    /// the underlying vector. Its `len` always equals `t1`; source elements
+    /// live in spare capacity `[s0..s1)`.
     v: &'a mut SmallVec<A>,
     /// the end of the target area
     t1: usize,
     /// the start of the source area
     s0: usize,
+    /// the end of the source area (in spare capacity, beyond `v.len()`)
+    s1: usize,
 }
 
 impl<'a, T: Debug, A: Array<Item = T>> Debug for InPlaceSmallVecBuilder<'a, A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let InPlaceSmallVecBuilder { s0, t1, v } = self;
-        let s1 = v.len();
+        let InPlaceSmallVecBuilder { s0, t1, s1, v } = self;
         let cap = v.capacity();
         write!(
             f,
@@ -31,10 +33,17 @@ impl<'a, T: Debug, A: Array<Item = T>> Debug for InPlaceSmallVecBuilder<'a, A> {
 /// The target part is initially empty.
 impl<'a, A: Array> From<&'a mut SmallVec<A>> for InPlaceSmallVecBuilder<'a, A> {
     fn from(value: &'a mut SmallVec<A>) -> Self {
+        let s1 = value.len();
+        // Establish the invariant `len == t1 == 0` from construction. This does
+        // NOT drop anything: the source bytes remain in spare capacity `[0..s1)`.
+        unsafe {
+            value.set_len(0);
+        }
         InPlaceSmallVecBuilder {
             v: value,
             s0: 0,
             t1: 0,
+            s1,
         }
     }
 }
@@ -47,12 +56,18 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
 
     /// The current source part as a slice
     pub fn source_slice(&self) -> &[A::Item] {
-        &self.v[self.s0..]
+        // The source lives in spare capacity beyond `v.len()`, so we cannot use
+        // ordinary slicing. The elements `[s0..s1)` are initialized.
+        unsafe { std::slice::from_raw_parts(self.v.as_ptr().add(self.s0), self.s1 - self.s0) }
     }
 
     /// The current source part as a slice
     pub fn source_slice_mut(&mut self) -> &mut [A::Item] {
-        &mut self.v[self.s0..]
+        // The source lives in spare capacity beyond `v.len()`, so we cannot use
+        // ordinary slicing. The elements `[s0..s1)` are initialized.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.v.as_mut_ptr().add(self.s0), self.s1 - self.s0)
+        }
     }
 
     /// ensure that we have at least `capacity` space.
@@ -60,21 +75,27 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
     fn reserve(&mut self, capacity: usize) {
         // ensure we have space!
         if self.t1 + capacity > self.s0 {
-            let v = &mut self.v;
-            let s0 = self.s0;
-            let s1 = v.len();
-            let sn = s1 - s0;
-            // delegate to the underlying vec for the grow logic
-            v.reserve(capacity);
-            // move the source to the end of the vec
-            let cap = v.capacity();
-            // just move source to the end without any concern about dropping
+            let sn = self.s1 - self.s0;
+            // Momentarily extend `len` to cover the source so that a realloc
+            // inside `SmallVec::reserve` preserves it (`reserve` only copies `[0..len)`).
+            // This transient `len == s1` window is non-reentrant, and allocation
+            // failure aborts rather than unwinds, so it is never observable by a leak.
             unsafe {
-                copy(v.as_mut_ptr(), s0, cap - sn, sn);
-                v.set_len(cap);
+                self.v.set_len(self.s1);
             }
-            // move s0
+            // delegate to the underlying vec for the grow logic
+            self.v.reserve(capacity);
+            // move the source to the end of the vec
+            let cap = self.v.capacity();
+            unsafe {
+                // just move source to the end without any concern about dropping
+                copy(self.v.as_mut_ptr(), self.s0, cap - sn, sn);
+                // restore the invariant `len == t1`
+                self.v.set_len(self.t1);
+            }
+            // move the source cursors
             self.s0 = cap - sn;
+            self.s1 = cap;
         }
     }
 
@@ -99,15 +120,19 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
     }
 
     fn push_unsafe(&mut self, value: A::Item) {
-        unsafe { std::ptr::write(self.v.as_mut_ptr().add(self.t1), value) }
-        self.t1 += 1;
+        unsafe {
+            std::ptr::write(self.v.as_mut_ptr().add(self.t1), value);
+            self.t1 += 1;
+            // keep the invariant `len == t1` so a leak right after a push is sound
+            self.v.set_len(self.t1);
+        }
     }
 
     /// Consume `n` elements from the source. If `take` is true they will be added to the target,
     /// else they will be dropped.
     #[inline]
     pub fn consume(&mut self, n: usize, take: bool) {
-        let n = std::cmp::min(n, self.source_slice().len());
+        let n = std::cmp::min(n, self.s1 - self.s0);
         let v = self.v.as_mut_ptr();
         if take {
             if self.t1 != self.s0 {
@@ -117,6 +142,10 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
             }
             self.t1 += n;
             self.s0 += n;
+            // keep the invariant `len == t1`
+            unsafe {
+                self.v.set_len(self.t1);
+            }
         } else {
             for _ in 0..n {
                 unsafe {
@@ -130,7 +159,7 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
     /// Skip up to `n` elements from source without adding them to the target.
     /// They will be immediately dropped!
     pub fn skip(&mut self, n: usize) {
-        let n = std::cmp::min(n, self.source_slice().len());
+        let n = std::cmp::min(n, self.s1 - self.s0);
         let v = self.v.as_mut_ptr();
         for _ in 0..n {
             unsafe {
@@ -143,7 +172,7 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
     /// Take up to `n` elements from source to target.
     /// If n is larger than the size of the remaining source, this will only copy all remaining elements in source.
     pub fn take(&mut self, n: usize) {
-        let n = std::cmp::min(n, self.source_slice().len());
+        let n = std::cmp::min(n, self.s1 - self.s0);
         if self.t1 != self.s0 {
             unsafe {
                 copy(self.v.as_mut_ptr(), self.s0, self.t1, n);
@@ -151,27 +180,36 @@ impl<'a, A: Array> InPlaceSmallVecBuilder<'a, A> {
         }
         self.t1 += n;
         self.s0 += n;
+        // keep the invariant `len == t1`
+        unsafe {
+            self.v.set_len(self.t1);
+        }
     }
 
     /// Takes the next element from the source, if it exists
     pub fn pop_front(&mut self) -> Option<A::Item> {
-        if self.s0 < self.v.len() {
+        if self.s0 < self.s1 {
+            let value = unsafe { std::ptr::read(self.v.as_ptr().add(self.s0)) };
             self.s0 += 1;
-            Some(unsafe { std::ptr::read(self.v.as_ptr().add(self.s0 - 1)) })
+            Some(value)
         } else {
             None
         }
     }
 
     fn drop_source(&mut self) {
-        // use truncate to get rid of the source part, if any, calling drop as needed
-        self.v.truncate(self.s0);
-        // use set_len to get rid of the gap part between t1 and s0, not calling drop!
+        // The target prefix is already the content of `v` (`len == t1`).
+        // Drop the source elements that live in spare capacity `[s0..s1)`.
+        // Set `s1 = s0` BEFORE dropping for panic-safety.
+        let start = self.s0;
+        let len = self.s1 - self.s0;
+        self.s1 = self.s0;
         unsafe {
-            self.v.set_len(self.t1);
+            std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                self.v.as_mut_ptr().add(start),
+                len,
+            ));
         }
-        self.s0 = self.t1;
-        // shorten the source part
     }
 }
 
@@ -286,5 +324,26 @@ mod tests {
             res.pop_front();
             res.pop_front();
         })
+    }
+
+    #[test]
+    fn forget_does_not_corrupt_vec() {
+        let td = TestDrop::new();
+        let (a_id, a) = td.new_item();
+        let (b_id, b) = td.new_item();
+        let (x_id, x) = td.new_item();
+
+        let mut vec: SmallVec<Array> = SmallVec::from_vec(vec![a, b]);
+        {
+            let mut builder: InPlaceSmallVecBuilder<Array> = (&mut vec).into();
+            builder.push(x); // enters the intermediate post-reserve state
+            std::mem::forget(builder);
+        }
+        assert_eq!(vec.len(), 1); // target prefix only, not the corrupt cap len
+        drop(vec); // must free x once, must NOT touch a/b
+
+        td.assert_drop(x_id); // moved into vec, dropped exactly once
+        td.assert_no_drop(a_id); // leaked in spare capacity (safe)
+        td.assert_no_drop(b_id);
     }
 }
