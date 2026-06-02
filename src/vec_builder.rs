@@ -3,6 +3,11 @@
 use core::fmt::Debug;
 
 /// builds a Vec out of itself
+///
+/// Takes over the source vector as storage and gives it back on drop.
+/// This is not observable unless you prevent drop from running using [`std::mem::forget`].
+/// If you prevent drop from running, the source vector will be empty and the contents
+/// are leaked.
 pub struct InPlaceVecBuilder<'a, T> {
     /// the underlying vector. While the builder is alive its `len` is kept at 0
     /// and it is treated as raw storage: the target lives in `[0..t1)` and the
