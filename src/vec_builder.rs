@@ -85,8 +85,11 @@ impl<'a, T> InPlaceVecBuilder<'a, T> {
             let sn = self.s1 - self.s0;
             // Momentarily extend `len` to cover the source so that a realloc
             // inside `Vec::reserve` preserves it (`reserve` only copies `[0..len)`).
-            // This transient `len == s1` window is non-reentrant, and allocation
-            // failure aborts rather than unwinds, so it is never observable by a leak.
+            // This transient `len == s1` window is sound because no user code runs
+            // in it, so `forget` cannot be slipped in to skip the fixup. If `reserve`
+            // unwinds (capacity overflow) our `Drop` restores the length and drops
+            // the source; if it aborts (OOM) the process dies. Either way the corrupt
+            // `len` is never exposed.
             unsafe {
                 v.set_len(self.s1);
             }
